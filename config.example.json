@@ -1,0 +1,41 @@
+{
+  "root_path": "/r/media/tv",
+  "api_base": "https://api.tvmaze.com",
+  "backup_directory": "/r/media/tv/.backups",
+  "supported_extensions": [
+    ".mkv",
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".m4v",
+    ".flv",
+    ".wmv",
+    ".ts"
+  ],
+  "naming_format": "{show_name} - s{season:02d}e{episode:02d} - {episode_name}",
+  "directory_structure": "{root}/{show_name}/Season {season:02d}/",
+  "cache_enabled": true,
+  "cache_ttl_days": 30,
+  "fuzzy_match_threshold": 0.6,
+  "create_nfo_files": false,
+  "create_folder_nfo": false,
+  "preserve_original_files": false,
+  "log_enabled": true,
+  "log_file": "/r/media/tv/.backups/rename.log",
+  "max_api_retries": 3,
+  "api_timeout_seconds": 10,
+  "handle_multi_episode": true,
+  "special_handling": {
+    "skip_folders": [
+      ".backup",
+      ".cache",
+      "unwatched",
+      "incomplete"
+    ],
+    "skip_patterns": [
+      "*sample*",
+      "*trailer*",
+      "*behind*"
+    ]
+  }
+}

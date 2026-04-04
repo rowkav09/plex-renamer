@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include QUICKSTART.md
+include FEATURES.md
+include DEVELOPMENT.md
+recursive-include . *.py
