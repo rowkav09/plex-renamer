@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import html
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -70,8 +71,18 @@ CONFIG = {
     "API_SEARCH": "https://api.tvmaze.com/search/shows?q=",
     "API_EPISODES": "https://api.tvmaze.com/shows",
     "TVDB_API_BASE": "https://api4.thetvdb.com/v4",
-    "PREFERRED_SOURCE": "tvmaze",  # tvmaze | tvdb
-    "SUPPORTED_EXTENSIONS": {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".flv", ".wmv"},
+    "PREFERRED_SOURCE": "tvmaze",  # fixed: tvmaze only
+    "NAMING_PROFILE": "plex",  # plex | kodi
+    "TV_EPISODE_FORMAT": "sxe",  # sxe | x
+    "KODI_WRITE_NFO": True,
+    "KODI_NFO_SOURCE": "tvdb",  # tvdb | imdb | tvmaze | auto
+    "KODI_CLEAN_EPISODE_TITLES": True,
+    "SAFE_MODE": True,
+    "PROTECT_NON_EMPTY_FOLDERS": True,
+    "SUPPORTED_EXTENSIONS": {
+        ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".flv", ".wmv",
+        ".m2ts", ".mts", ".ts", ".mpeg", ".mpg", ".asf", ".qt", ".iso"
+    },
     "BACKUP_DIR": r"/r/media/tv/.backups",
     "HISTORY_FILE": r"/r/media/tv/.backups/rename_history.json",
     "CACHE_FILE": r"/r/media/tv/.backups/show_cache.json",
@@ -143,9 +154,14 @@ class TVMazeAPI:
         self.cache = cache
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'PlexRenamer/1.0'})
+        self.preferred_source = "tvmaze"
         self.tvdb_api_key = os.getenv("TVDB_API_KEY", "").strip()
         self.tvdb_pin = os.getenv("TVDB_PIN", "").strip()
         self.tvdb_token: Optional[str] = None
+
+    def set_preferred_source(self, source: str):
+        """Set preferred metadata source for this runtime session."""
+        self.preferred_source = "tvmaze"
 
     def _tvdb_headers(self) -> Optional[Dict[str, str]]:
         """Build TVDB auth headers if credentials are available."""
@@ -245,7 +261,7 @@ class TVMazeAPI:
         if cached:
             return cached
 
-        preferred = CONFIG.get('PREFERRED_SOURCE', 'tvmaze').strip().lower()
+        preferred = "tvmaze"
         ordered_sources = ['tvdb', 'tvmaze'] if preferred == 'tvdb' else ['tvmaze', 'tvdb']
 
         for source in ordered_sources:
@@ -276,7 +292,7 @@ class TVMazeAPI:
     def get_episode(self, show_id: int, season: int, episode: int) -> Optional[str]:
         """Get episode name from show ID."""
         # Try preferred source first, then fallback.
-        preferred = CONFIG.get('PREFERRED_SOURCE', 'tvmaze').strip().lower()
+        preferred = "tvmaze"
 
         if preferred == 'tvdb':
             ep_name = self._get_episode_tvdb(show_id, season, episode)
@@ -448,14 +464,225 @@ class EpisodeExtractor:
         
         return None
 
+    @staticmethod
+    def extract_episode_title_from_filename(filename: str) -> Optional[str]:
+        """Extract a human title from filenames like 'Season 1 Episode 02 - 46 Long'."""
+        stem = os.path.splitext(filename)[0]
+        patterns = [
+            r'(?i)\bseason[\s._-]*\d+[\s._-]*(?:episode|ep)[\s._-]*\d+\s*[-:.]\s*(.+)$',
+            r'(?i)\b[s]\d{1,2}[e]\d{1,2}(?:-[e]\d{1,2})?\s*[-:.]\s*(.+)$',
+            r'(?i)\b\d{1,2}x\d{1,2}\s*[-:.]\s*(.+)$',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, stem)
+            if match:
+                title = match.group(1).strip(" .-_")
+                if title:
+                    return title
+        return None
+
 
 class FileRenamer:
     """Handles file scanning and rename planning."""
     
-    def __init__(self, api: TVMazeAPI, detector: ShowDetector, root_path: str):
+    def __init__(
+        self,
+        api: TVMazeAPI,
+        detector: ShowDetector,
+        root_path: str,
+        tv_episode_format: str = "sxe",
+        naming_profile: str = "plex"
+    ):
         self.api = api
         self.detector = detector
         self.root_path = root_path
+        self.tv_episode_format = tv_episode_format.strip().lower()
+        self.naming_profile = naming_profile.strip().lower()
+        self._root_dir_names_cache: Optional[List[str]] = None
+
+    def _format_episode_token(self, season: int, start_ep: int, end_ep: Optional[int]) -> str:
+        """Format TV episode token based on selected naming convention."""
+        # Kodi profile always uses strict SxxEyy style.
+        if self.naming_profile == "kodi":
+            if end_ep:
+                return f"S{season:02d}E{start_ep:02d}E{end_ep:02d}"
+            return f"S{season:02d}E{start_ep:02d}"
+
+        if self.tv_episode_format == "x":
+            if end_ep:
+                return f"{season}x{start_ep:02d}-x{end_ep:02d}"
+            return f"{season}x{start_ep:02d}"
+
+        if end_ep:
+            return f"s{season:02d}e{start_ep:02d}-e{end_ep:02d}"
+        return f"s{season:02d}e{start_ep:02d}"
+
+    @staticmethod
+    def _sanitize_path_component(value: str) -> str:
+        """Sanitize filename/folder name for cross-platform filesystem safety."""
+        sanitized = re.sub(r'[<>:"/\\|?*]', '', value)
+        sanitized = sanitized.strip().rstrip('.')
+        return sanitized
+
+    @staticmethod
+    def _extract_show_year(show_data: Dict) -> Optional[int]:
+        """Extract a release year from API show metadata when available."""
+        candidates = [
+            show_data.get('premiered'),
+            show_data.get('firstAired'),
+            show_data.get('year'),
+        ]
+        for value in candidates:
+            if value is None:
+                continue
+            match = re.search(r'\b(19\d{2}|20\d{2})\b', str(value))
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _normalize_title_base(value: str) -> str:
+        """Normalize a show title for folder-matching (ignores optional year suffix)."""
+        base = re.sub(r'\s*\(\d{4}\)\s*$', '', value).strip().lower()
+        base = re.sub(r'[^a-z0-9]+', '', base)
+        return base
+
+    def _get_root_dir_names(self) -> List[str]:
+        """Return top-level directories in root path (cached for one scan session)."""
+        if self._root_dir_names_cache is not None:
+            return self._root_dir_names_cache
+
+        names: List[str] = []
+        try:
+            for entry in os.scandir(self.root_path):
+                if entry.is_dir():
+                    names.append(entry.name)
+        except Exception:
+            names = []
+
+        self._root_dir_names_cache = names
+        return names
+
+    def _resolve_existing_show_folder(self, show_name: str, preferred_folder: str) -> str:
+        """Reuse existing folder variants to avoid creating duplicate series folders."""
+        existing = self._get_root_dir_names()
+        if not existing:
+            return preferred_folder
+
+        target_base = self._normalize_title_base(show_name)
+        candidates = [name for name in existing if self._normalize_title_base(name) == target_base]
+
+        # If preferred already exists and there are no competing variants, use it directly.
+        if preferred_folder in existing and len(candidates) <= 1:
+            return preferred_folder
+
+        if not candidates:
+            return preferred_folder
+
+        # Prefer year-qualified folders when available, then exact plain title, then first stable candidate.
+        year_candidates = sorted([name for name in candidates if re.search(r'\(\d{4}\)\s*$', name)])
+        if year_candidates:
+            return year_candidates[0]
+
+        plain_title = self._sanitize_path_component(show_name)
+        if plain_title in candidates:
+            return plain_title
+
+        return sorted(candidates)[0]
+
+    def write_kodi_tvshow_nfo(self, show_folder_path: str, show_data: Dict) -> bool:
+        """Write tvshow.nfo with a TVMaze URL to lock Kodi scraper matching."""
+        externals = show_data.get('externals') or {}
+        imdb_id = externals.get('imdb')
+        tvdb_id = externals.get('thetvdb')
+        tvmaze_id = show_data.get('id')
+
+        preference = CONFIG.get("KODI_NFO_SOURCE", "auto").strip().lower()
+        nfo_url = None
+
+        if preference == "tvdb" and tvdb_id:
+            nfo_url = f"https://www.thetvdb.com/series/{tvdb_id}"
+        elif preference == "imdb" and imdb_id:
+            nfo_url = f"https://www.imdb.com/title/{imdb_id}/"
+        elif preference == "tvmaze" and tvmaze_id:
+            nfo_url = f"https://www.tvmaze.com/shows/{tvmaze_id}"
+        elif preference == "auto":
+            if imdb_id:
+                nfo_url = f"https://www.imdb.com/title/{imdb_id}/"
+            elif tvdb_id:
+                nfo_url = f"https://www.thetvdb.com/series/{tvdb_id}"
+            elif tvmaze_id:
+                nfo_url = f"https://www.tvmaze.com/shows/{tvmaze_id}"
+
+        if not nfo_url:
+            # Fallback order if preferred source is unavailable.
+            if tvdb_id:
+                nfo_url = f"https://www.thetvdb.com/series/{tvdb_id}"
+            elif imdb_id:
+                nfo_url = f"https://www.imdb.com/title/{imdb_id}/"
+            elif tvmaze_id:
+                nfo_url = f"https://www.tvmaze.com/shows/{tvmaze_id}"
+            else:
+                return False
+
+        nfo_path = os.path.join(show_folder_path, "tvshow.nfo")
+        nfo_content = f"{nfo_url}\n"
+
+        try:
+            os.makedirs(show_folder_path, exist_ok=True)
+            if os.path.exists(nfo_path):
+                with open(nfo_path, "r", encoding="utf-8") as f:
+                    existing = f.read().strip()
+                if existing == nfo_content.strip():
+                    return True
+            with open(nfo_path, "w", encoding="utf-8") as f:
+                f.write(nfo_content)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def clean_kodi_episode_title(title: str) -> str:
+        """Normalize stylized titles so Kodi display avoids fake media extensions."""
+        value = html.unescape((title or "").strip())
+        value = re.sub(r'\.(mov|mpeg|mkv|mp4|wmv|avi|flv|m4v)$', '', value, flags=re.I)
+        # Remove prefixes like "eps1.0_" so Kodi doesn't show redundant numbering.
+        value = re.sub(r'(?i)^eps\d+(?:\.\d+)?[_\s-]*', '', value)
+        value = value.replace('_', ' ')
+        value = re.sub(r'\s+', ' ', value).strip()
+        return value
+
+    @staticmethod
+    def write_kodi_episode_nfo(
+        media_file_path: str,
+        show_name: str,
+        season: int,
+        episode: int,
+        episode_title: str
+    ) -> bool:
+        """Write sidecar episode NFO next to media file for Kodi episode title override."""
+        nfo_path = os.path.splitext(media_file_path)[0] + ".nfo"
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<episodedetails>\n'
+            f'  <title>{html.escape(episode_title)}</title>\n'
+            f'  <showtitle>{html.escape(show_name)}</showtitle>\n'
+            f'  <season>{season}</season>\n'
+            f'  <episode>{episode}</episode>\n'
+            '</episodedetails>\n'
+        )
+
+        try:
+            if os.path.exists(nfo_path):
+                with open(nfo_path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+                if existing == xml:
+                    return True
+            with open(nfo_path, "w", encoding="utf-8") as f:
+                f.write(xml)
+            return True
+        except Exception:
+            return False
     
     def scan_media_files(self, root_path: str) -> List[str]:
         """Scan for media files."""
@@ -520,6 +747,8 @@ class FileRenamer:
         else:
             movie_base = title
 
+        movie_base = self._sanitize_path_component(movie_base)
+
         new_filename = f"{movie_base}{ext}"
         new_path = os.path.join(self.root_path, movie_base, new_filename)
 
@@ -564,22 +793,47 @@ class FileRenamer:
             return None
         
         # Get episode name
+        filename_ep_title = EpisodeExtractor.extract_episode_title_from_filename(filename)
         ep_name = self.api.get_episode(show_id, season, start_ep)
+        if ep_name:
+            ep_name = html.unescape(ep_name)
+        if filename_ep_title:
+            # Prefer source filename title when present; these rips are often more accurate for casing/punctuation.
+            ep_name = filename_ep_title
         if not ep_name:
             ep_name = f"Episode {start_ep}"
         
         # Build Plex-perfect path
         season_folder = f"Season {season:02d}"
-        show_folder = show_name
+        show_year = self._extract_show_year(show_data)
+        if show_year:
+            preferred_show_folder = self._sanitize_path_component(f"{show_name} ({show_year})")
+        else:
+            preferred_show_folder = self._sanitize_path_component(show_name)
+        show_folder = self._resolve_existing_show_folder(show_name, preferred_show_folder)
+        show_folder_path = os.path.join(self.root_path, show_folder)
+
+        if self.naming_profile == "kodi" and CONFIG.get("KODI_WRITE_NFO", True):
+            self.write_kodi_tvshow_nfo(show_folder_path, show_data)
         
         # Format episode string
-        if end_ep:
-            ep_str = f"{season}x{start_ep:02d}-x{end_ep:02d}"
-        else:
-            ep_str = f"{season}x{start_ep:02d}"
+        ep_str = self._format_episode_token(season, start_ep, end_ep)
         
-        new_filename = f"{show_name} - {ep_str} - {ep_name}{ext}"
-        new_path = os.path.join(self.root_path, show_folder, season_folder, new_filename)
+        if show_year:
+            display_show_name = f"{show_name} ({show_year})"
+        else:
+            display_show_name = show_name
+
+        safe_show_name = self._sanitize_path_component(display_show_name)
+        safe_ep_name = self._sanitize_path_component(ep_name)
+
+        if self.naming_profile == "kodi":
+            # Kodi strict form: Show Name (Year) - S01E01.ext
+            new_filename = f"{safe_show_name} - {ep_str}{ext}"
+        else:
+            # Plex-friendly form keeps human episode title.
+            new_filename = f"{safe_show_name} - {ep_str} - {safe_ep_name}{ext}"
+        new_path = os.path.join(show_folder_path, season_folder, new_filename)
         
         # Skip if already correctly named
         if file_path.lower() == new_path.lower():
@@ -695,6 +949,12 @@ class PlexRenamer:
     @staticmethod
     def _resolve_root_path(root_path: str, media_type: str = "tv") -> str:
         """Resolve a usable media root across common Windows/Linux path styles."""
+        # On Windows, transparently map /r/... style defaults to R:\... paths.
+        if os.name == "nt" and root_path.startswith("/r/"):
+            mapped_root = f"R:\\{root_path[3:].replace('/', '\\')}"
+            if os.path.exists(mapped_root):
+                return mapped_root
+
         if os.path.exists(root_path) and PlexRenamer._has_media_files(root_path):
             return root_path
 
@@ -729,8 +989,18 @@ class PlexRenamer:
 
         return root_path
     
-    def __init__(self, root_path: str = CONFIG['ROOT'], media_type: str = "tv"):
+    def __init__(
+        self,
+        root_path: str = CONFIG['ROOT'],
+        media_type: str = "tv",
+        tv_episode_format: str = CONFIG['TV_EPISODE_FORMAT'],
+        naming_profile: str = CONFIG['NAMING_PROFILE'],
+        metadata_source: str = CONFIG['PREFERRED_SOURCE']
+    ):
         self.media_type = media_type
+        self.tv_episode_format = tv_episode_format.strip().lower()
+        self.naming_profile = naming_profile.strip().lower()
+        self.metadata_source = "tvmaze"
         self.root_path = self._resolve_root_path(root_path, media_type)
         self.backup_dir = os.path.join(self.root_path, ".backups")
         self.cache_file = os.path.join(self.backup_dir, "show_cache.json")
@@ -738,17 +1008,46 @@ class PlexRenamer:
 
         self.cache = ShowCache(self.cache_file)
         self.api = TVMazeAPI(self.cache)
+        self.api.set_preferred_source("tvmaze")
         self.detector = ShowDetector(self.api)
-        self.renamer = FileRenamer(self.api, self.detector, self.root_path)
+        self.renamer = FileRenamer(
+            self.api,
+            self.detector,
+            self.root_path,
+            self.tv_episode_format,
+            self.naming_profile
+        )
         self.history = RenameHistory(self.history_file)
         self.actions: List[RenameAction] = []
 
-    def configure_runtime(self, root_path: str, media_type: str):
+    @staticmethod
+    def _is_non_empty_directory(path: str) -> bool:
+        """Return True when a directory contains at least one file or child directory."""
+        if not os.path.isdir(path):
+            return False
+        try:
+            return any(True for _ in os.scandir(path))
+        except Exception:
+            return True
+
+    def configure_runtime(
+        self,
+        root_path: str,
+        media_type: str,
+        tv_episode_format: Optional[str] = None,
+        naming_profile: Optional[str] = None,
+        metadata_source: Optional[str] = None
+    ):
         """Update runtime target folder and media type from interactive prompts."""
         selected_type = media_type.strip().lower()
+        selected_episode_format = (tv_episode_format or self.tv_episode_format).strip().lower()
+        selected_naming_profile = (naming_profile or self.naming_profile).strip().lower()
         resolved_root = self._resolve_root_path(root_path, selected_type)
 
         self.media_type = selected_type
+        self.tv_episode_format = selected_episode_format
+        self.naming_profile = selected_naming_profile
+        self.metadata_source = "tvmaze"
         self.root_path = resolved_root
         self.backup_dir = os.path.join(self.root_path, ".backups")
         self.cache_file = os.path.join(self.backup_dir, "show_cache.json")
@@ -756,8 +1055,15 @@ class PlexRenamer:
 
         self.cache = ShowCache(self.cache_file)
         self.api = TVMazeAPI(self.cache)
+        self.api.set_preferred_source("tvmaze")
         self.detector = ShowDetector(self.api)
-        self.renamer = FileRenamer(self.api, self.detector, self.root_path)
+        self.renamer = FileRenamer(
+            self.api,
+            self.detector,
+            self.root_path,
+            self.tv_episode_format,
+            self.naming_profile
+        )
         self.history = RenameHistory(self.history_file)
         self.actions = []
     
@@ -795,6 +1101,259 @@ class PlexRenamer:
             )
         
         console.print(table)
+
+    def _discover_folder_layout_fixes(self) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, str, str]]]:
+        """Plan top-level TV folder rename fixes and blocked conflicts.
+
+        Returns:
+        - fixes: (old_path, new_path, reason)
+        - blocked: (old_path, desired_path, reason)
+        """
+        fixes: List[Tuple[str, str, str]] = []
+        blocked: List[Tuple[str, str, str]] = []
+        if not os.path.exists(self.root_path):
+            return fixes, blocked
+
+        try:
+            entries = [e for e in os.scandir(self.root_path) if e.is_dir()]
+        except Exception:
+            return fixes, blocked
+
+        existing_names = {e.name.lower(): e.name for e in entries}
+
+        for entry in entries:
+            current_name = entry.name
+            if current_name.startswith('.'):
+                continue
+
+            cleaned = self.detector.clean_name(current_name)
+            if not cleaned:
+                continue
+
+            base_query = re.sub(r'\s*\(\d{4}\)\s*$', '', cleaned).strip()
+            if not base_query:
+                continue
+
+            show_data = self.api.search_show(base_query)
+            if not show_data or not show_data.get('name'):
+                continue
+
+            show_name = show_data.get('name')
+            show_year = self.renamer._extract_show_year(show_data)
+            if show_year:
+                desired_name = self.renamer._sanitize_path_component(f"{show_name} ({show_year})")
+            else:
+                desired_name = self.renamer._sanitize_path_component(show_name)
+
+            if current_name.lower() == desired_name.lower():
+                continue
+
+            target_exists = desired_name.lower() in existing_names and existing_names[desired_name.lower()] != current_name
+            if target_exists:
+                old_path = os.path.join(self.root_path, current_name)
+                desired_path = os.path.join(self.root_path, desired_name)
+                blocked.append((old_path, desired_path, "target already exists"))
+                continue
+
+            old_path = os.path.join(self.root_path, current_name)
+            new_path = os.path.join(self.root_path, desired_name)
+            fixes.append((old_path, new_path, f"{current_name} -> {desired_name}"))
+
+        return fixes, blocked
+
+    def fix_folder_layout(self):
+        """Rename top-level show folders in place to normalized names without moving individual files."""
+        if self.media_type not in ("tv", "both"):
+            console.print("[yellow]Folder layout fix currently applies to TV show roots only.[/yellow]")
+            return
+
+        fixes, blocked = self._discover_folder_layout_fixes()
+        if not fixes and not blocked:
+            console.print("[yellow]No folder layout fixes needed.[/yellow]")
+            return
+
+        if fixes:
+            table = Table(title=f"Folder Layout Fixes ({len(fixes)})")
+            table.add_column("Current Folder", style="cyan")
+            table.add_column("New Folder", style="green")
+            for old_path, new_path, _ in fixes[:30]:
+                table.add_row(os.path.basename(old_path), os.path.basename(new_path))
+            console.print(table)
+
+        if blocked:
+            blocked_table = Table(title=f"Blocked Folder Fixes ({len(blocked)})")
+            blocked_table.add_column("Current Folder", style="yellow")
+            blocked_table.add_column("Desired Folder", style="magenta")
+            blocked_table.add_column("Reason", style="red")
+            for old_path, desired_path, reason in blocked[:30]:
+                blocked_table.add_row(os.path.basename(old_path), os.path.basename(desired_path), reason)
+            console.print(blocked_table)
+
+        if fixes and not Confirm.ask("Apply direct folder rename fixes?", default=True):
+            return
+
+        renamed = 0
+        skipped = 0
+        protected_non_empty = 0
+        allow_non_empty = not CONFIG.get("PROTECT_NON_EMPTY_FOLDERS", True)
+
+        if not allow_non_empty:
+            allow_non_empty = Confirm.ask(
+                "Allow renaming non-empty folders? (recommended: no)",
+                default=False
+            )
+
+        if fixes:
+            for old_path, new_path, _ in fixes:
+                try:
+                    if os.path.exists(new_path):
+                        skipped += 1
+                        continue
+
+                    if self._is_non_empty_directory(old_path) and not allow_non_empty:
+                        protected_non_empty += 1
+                        continue
+
+                    os.rename(old_path, new_path)
+                    renamed += 1
+                except Exception as e:
+                    skipped += 1
+                    console.print(f"[red]Folder rename error: {old_path} -> {e}[/red]")
+
+        # Optional fallback: still rename blocked folders, but with a suffix, never moving contents.
+        if blocked and Confirm.ask("Rename blocked folders with suffix ' - unmerged' (still rename-only)?", default=False):
+            for old_path, desired_path, _ in blocked:
+                desired_name = os.path.basename(desired_path)
+                parent = os.path.dirname(desired_path)
+
+                if self._is_non_empty_directory(old_path) and not allow_non_empty:
+                    protected_non_empty += 1
+                    continue
+
+                candidate = f"{desired_name} - unmerged"
+                index = 2
+                while os.path.exists(os.path.join(parent, candidate)):
+                    candidate = f"{desired_name} - unmerged {index}"
+                    index += 1
+
+                fallback_path = os.path.join(parent, candidate)
+                try:
+                    os.rename(old_path, fallback_path)
+                    renamed += 1
+                except Exception as e:
+                    skipped += 1
+                    console.print(f"[red]Folder rename error: {old_path} -> {e}[/red]")
+
+        if skipped or protected_non_empty:
+            console.print(
+                f"[yellow]Folder layout fix complete: renamed {renamed}, skipped {skipped}, protected non-empty {protected_non_empty}.[/yellow]"
+            )
+        else:
+            console.print(f"[green]Folder layout fix complete: renamed {renamed}.[/green]")
+
+    def generate_kodi_nfo_for_all_shows(self):
+        """Generate/update tvshow.nfo for all top-level TV show folders without renaming files."""
+        if self.media_type not in ("tv", "both"):
+            console.print("[yellow]NFO generation currently applies to TV show roots only.[/yellow]")
+            return
+
+        if not os.path.exists(self.root_path):
+            console.print("[yellow]TV root path does not exist.[/yellow]")
+            return
+
+        show_dirs = []
+        for entry in os.scandir(self.root_path):
+            if entry.is_dir() and not entry.name.startswith('.'):
+                show_dirs.append(entry)
+
+        if not show_dirs:
+            console.print("[yellow]No show folders found.[/yellow]")
+            return
+
+        written = 0
+        skipped = 0
+        failed = 0
+
+        for entry in sorted(show_dirs, key=lambda e: e.name.lower()):
+            cleaned = self.detector.clean_name(entry.name)
+            query = re.sub(r'\s*\(\d{4}\)\s*$', '', cleaned).strip()
+            if not query:
+                skipped += 1
+                continue
+
+            show_data = self.api.search_show(query)
+            if not show_data or not show_data.get('id'):
+                skipped += 1
+                continue
+
+            if self.renamer.write_kodi_tvshow_nfo(entry.path, show_data):
+                written += 1
+            else:
+                failed += 1
+
+        if failed:
+            console.print(f"[yellow]NFO generation complete: written {written}, skipped {skipped}, failed {failed}.[/yellow]")
+        else:
+            console.print(f"[green]NFO generation complete: written {written}, skipped {skipped}.[/green]")
+
+    def generate_kodi_episode_nfo_for_all_shows(self):
+        """Generate/update per-episode NFO sidecars to control Kodi episode titles."""
+        if self.media_type not in ("tv", "both"):
+            console.print("[yellow]Episode NFO generation currently applies to TV show roots only.[/yellow]")
+            return
+
+        if not os.path.exists(self.root_path):
+            console.print("[yellow]TV root path does not exist.[/yellow]")
+            return
+
+        written = 0
+        skipped = 0
+        failed = 0
+
+        show_dirs = [e for e in os.scandir(self.root_path) if e.is_dir() and not e.name.startswith('.')]
+        for show_dir in sorted(show_dirs, key=lambda e: e.name.lower()):
+            show_query = re.sub(r'\s*\(\d{4}\)\s*$', '', self.detector.clean_name(show_dir.name)).strip()
+            if not show_query:
+                continue
+
+            show_data = self.api.search_show(show_query)
+            if not show_data or not show_data.get('id'):
+                continue
+
+            show_id = show_data.get('id')
+            show_name = show_data.get('name') or show_query
+
+            for root, _, files in os.walk(show_dir.path):
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    if not any(filename.lower().endswith(ext) for ext in CONFIG['SUPPORTED_EXTENSIONS']):
+                        continue
+
+                    ep_info = EpisodeExtractor.extract_episodes(filename)
+                    if not ep_info:
+                        skipped += 1
+                        continue
+
+                    season, start_ep, _ = ep_info
+                    ep_name = self.api.get_episode(show_id, season, start_ep)
+                    if not ep_name:
+                        ep_name = EpisodeExtractor.extract_episode_title_from_filename(filename)
+                    if not ep_name:
+                        ep_name = f"Episode {start_ep}"
+
+                    if CONFIG.get("KODI_CLEAN_EPISODE_TITLES", True):
+                        ep_name = self.renamer.clean_kodi_episode_title(ep_name)
+
+                    ok = self.renamer.write_kodi_episode_nfo(file_path, show_name, season, start_ep, ep_name)
+                    if ok:
+                        written += 1
+                    else:
+                        failed += 1
+
+        if failed:
+            console.print(f"[yellow]Episode NFO generation complete: written {written}, skipped {skipped}, failed {failed}.[/yellow]")
+        else:
+            console.print(f"[green]Episode NFO generation complete: written {written}, skipped {skipped}.[/green]")
     
     def scan_and_plan(self):
         """Scan files and plan renames."""
@@ -809,7 +1368,7 @@ class PlexRenamer:
             console.print("[yellow]No media files found.[/yellow]")
             return
 
-        status_step = max(1, len(files) // 10)
+        status_step = max(1, len(files) // 50)
         console.print("[cyan]Planning renames...[/cyan]")
 
         for idx, file_path in enumerate(files, start=1):
@@ -818,7 +1377,9 @@ class PlexRenamer:
                 self.actions.append(action)
 
             if idx % status_step == 0 or idx == len(files):
-                console.print(f"  Processed {idx}/{len(files)} files")
+                print(f"\r  Processed {idx}/{len(files)} files", end="", flush=True)
+
+        print()
         
         console.print(f"\nPlanned [cyan]{len(self.actions)}[/cyan] rename operations")
     
@@ -830,10 +1391,25 @@ class PlexRenamer:
         console.print(f"\n[bold]Applying {len(self.actions)} changes...[/bold]\n")
 
         total = len(self.actions)
-        status_step = max(1, total // 10)
+        status_step = max(1, total // 50)
+        success_count = 0
+        failure_count = 0
+        skipped_count = 0
 
         for idx, action in enumerate(self.actions, start=1):
             try:
+                if not os.path.exists(action.original_path):
+                    skipped_count += 1
+                    print()
+                    console.print(f"[yellow]Skipped missing source: {action.original_path}[/yellow]")
+                    continue
+
+                if os.path.exists(action.new_path):
+                    skipped_count += 1
+                    print()
+                    console.print(f"[yellow]Skipped existing destination: {action.new_path}[/yellow]")
+                    continue
+
                 # Create parent directories
                 os.makedirs(os.path.dirname(action.new_path), exist_ok=True)
                 
@@ -842,14 +1418,24 @@ class PlexRenamer:
                 
                 # Record in history
                 self.history.record_rename(action)
+                success_count += 1
                 
             except Exception as e:
+                failure_count += 1
+                print()
                 console.print(f"[red]Error: {action.original_path} -> {e}[/red]")
 
             if idx % status_step == 0 or idx == total:
-                console.print(f"  Applied {idx}/{total} changes")
+                print(f"\r  Applied {idx}/{total} changes", end="", flush=True)
+
+        print()
         
-        console.print("\n[green]✓ All changes applied successfully![/green]")
+        if failure_count or skipped_count:
+            console.print(
+                f"\n[yellow]Applied {success_count}/{total} changes with {failure_count} error(s) and {skipped_count} skipped.[/yellow]"
+            )
+        else:
+            console.print("\n[green]✓ All changes applied successfully![/green]")
     
     def show_recent_history(self, count: int = 10):
         """Display recent rename history."""
@@ -886,9 +1472,18 @@ class PlexRenamer:
 
         entered_root = Prompt.ask("Media folder path", default=self.root_path).strip()
         media_type = Prompt.ask("Media type", choices=["tv", "movies", "both"], default=self.media_type)
-        self.configure_runtime(entered_root, media_type)
+        naming_profile = Prompt.ask("Naming profile", choices=["plex", "kodi"], default=self.naming_profile)
+        episode_format = Prompt.ask(
+            "TV episode naming",
+            choices=["sxe", "x"],
+            default=self.tv_episode_format
+        )
+        self.configure_runtime(entered_root, media_type, episode_format, naming_profile)
         console.print(f"Using folder: [cyan]{self.root_path}[/cyan]")
         console.print(f"Media type: [cyan]{self.media_type}[/cyan]")
+        console.print(f"Profile: [cyan]{self.naming_profile}[/cyan]")
+        console.print(f"TV naming: [cyan]{self.tv_episode_format}[/cyan]")
+        console.print("Metadata DB: [cyan]tvmaze[/cyan]")
         
         while True:
             console.print("\n[bold cyan]Options:[/bold cyan]")
@@ -897,9 +1492,12 @@ class PlexRenamer:
             console.print("3. Apply changes")
             console.print("4. View recent history")
             console.print("5. Undo last rename")
-            console.print("6. Exit")
+            console.print("6. Fix folder layout (rename folders only)")
+            console.print("7. Generate Kodi tvshow.nfo files")
+            console.print("8. Generate Kodi episode .nfo files")
+            console.print("9. Exit")
             
-            choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "5", "6"])
+            choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"])
             
             if choice == "1":
                 self.scan_and_plan()
@@ -918,6 +1516,12 @@ class PlexRenamer:
                 else:
                     console.print("[red]Nothing to undo[/red]")
             elif choice == "6":
+                self.fix_folder_layout()
+            elif choice == "7":
+                self.generate_kodi_nfo_for_all_shows()
+            elif choice == "8":
+                self.generate_kodi_episode_nfo_for_all_shows()
+            elif choice == "9":
                 console.print("[cyan]Goodbye![/cyan]")
                 break
 
