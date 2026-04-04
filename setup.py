@@ -8,7 +8,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="plex-renamer",
-    version="1.0.0",
+    version="1.1.0",
     author="Plex Renamer Contributors",
     description="Professional tool for organizing TV shows in Plex-perfect format",
     long_description=long_description,
