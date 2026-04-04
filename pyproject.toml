@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plex-renamer"
-version = "1.0.0"
+version = "1.1.0"
 description = "Professional tool for organizing TV shows in Plex-perfect format"
 readme = "README.md"
 requires-python = ">=3.7"

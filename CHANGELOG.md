@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-04-04
+
+### Added
+- Optional TVDB v4 integration with `TVDB_API_KEY`/`TVDB_PIN` support and source fallback.
+- Runtime startup prompts for media folder path and media type (`tv`, `movies`, `both`).
+- Movie renaming mode for Plex format: `Movie Name (Year)/Movie Name (Year).ext`.
+- Combined `both` mode to process TV and movie files in a single scan.
+
+### Changed
+- Reduced terminal UI motion by replacing animated progress bars with clean periodic status updates.
+- Dependency install flow now runs in quiet mode with concise success/failure output.
+- TV output naming format changed to `1x01` style episode tokens.
+- Scan root and backup/cache/history paths are now resolved from selected runtime media folder.
+
+### Fixed
+- Added support for `Season X Episode YY` filename patterns.
+- Improved show detection to avoid generic folder names like `Season 1` and fallback to filename parsing.
+- Fixed false episode-range parsing with numeric titles (for example: `Episode 02 - 46 Long`).
+- Corrected target path handling to avoid hardcoded root mismatches on Windows.
+
 ## [1.0.0] - 2026-04-04
 
 ### Added

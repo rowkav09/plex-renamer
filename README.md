@@ -31,6 +31,7 @@ Professional tool for organizing TV shows in Plex-perfect format with advanced f
 ### Requirements
 - Python 3.7+
 - Internet connection (for TVMaze API)
+- Optional: TVDB API key for TVDB fallback/lookups
 
 ### Setup
 ```bash
@@ -51,6 +52,9 @@ python plex_renamer.py
 
 Then follow the menu:
 ```
+Media folder path (...):
+Media type [tv/movies/both] (...):
+
 Options:
 1. Scan and plan renames
 2. Show rename plan
@@ -93,20 +97,41 @@ Options → 5 (Undo last rename)
 
 ## Configuration
 
-Edit the `CONFIG` dictionary in `plex_renamer.py`:
+No external config file is required.
+
+At startup, the script asks for:
+- Media folder path
+- Media type: `tv`, `movies`, or `both`
+
+Core defaults and API settings are kept directly inside `plex_renamer.py` in the `CONFIG` dictionary:
 
 ```python
 CONFIG = {
     "ROOT": r"/r/media/tv",                        # Root TV library path
     "API_SEARCH": "https://api.tvmaze.com/...",   # TVMaze API endpoint
+  "TVDB_API_BASE": "https://api4.thetvdb.com/v4",  # TVDB v4 API endpoint
+  "PREFERRED_SOURCE": "tvmaze",                   # tvmaze or tvdb
     "SUPPORTED_EXTENSIONS": {                       # Video file types
         ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".flv", ".wmv"
     },
-    "BACKUP_DIR": r"/r/media/tv/.backups",        # Backup location
-    "HISTORY_FILE": r"/r/media/tv/.backups/rename_history.json",
-    "CACHE_FILE": r"/r/media/tv/.backups/show_cache.json",
 }
 ```
+
+### TVDB Setup (Optional)
+
+Set environment variables before running if you want TVDB support:
+
+```bash
+# Linux/macOS
+export TVDB_API_KEY="your_api_key"
+export TVDB_PIN="your_pin_if_required"
+
+# Windows PowerShell
+$env:TVDB_API_KEY="your_api_key"
+$env:TVDB_PIN="your_pin_if_required"
+```
+
+Then set `PREFERRED_SOURCE` to `"tvdb"` in `plex_renamer.py`.
 
 ## How It Works
 
@@ -117,6 +142,7 @@ CONFIG = {
 
 ### 2. Show Detection
 - Parses folder names for show title
+- Falls back to parsing the show title from filename when folder names are generic
 - Removes common patterns: [1080p], (2020), special characters
 - Performs fuzzy matching if direct search fails
 - Queries TVMaze API for official show info
@@ -161,14 +187,17 @@ The tool recognizes these episode patterns:
 | S01E01 | `Show.S01E01.mkv` | s01e01 |
 | s01e01 | `show.s01e01.mkv` | s01e01 |
 | 1x01 | `show.1x01.mkv` | s01e01 |
+| Season 1 Episode 01 | `Show Season 1 Episode 01 - Pilot.mkv` | s01e01 |
 | S01E01-E03 | `Show.S01E01-E03.mkv` | s01e01-e03 |
 
 ## API
 
-The tool uses **TVMaze** API (free, no key required):
+The tool uses **TVMaze** API by default (free, no key required):
 - Show search: Finds show ID and official name
 - Episode lookup: Fetches episode names and info
 - Caching built-in: Reduces API load
+
+Optional **TVDB v4** support is available if you provide `TVDB_API_KEY` (and `TVDB_PIN` when required).
 
 ## Troubleshooting
 

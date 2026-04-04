@@ -14,6 +14,8 @@ import os
 import json
 import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -23,17 +25,35 @@ import difflib
 try:
     import requests
     from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
     from rich.table import Table
     from rich.panel import Panel
     from rich.prompt import Confirm, Prompt
     from rich.syntax import Syntax
 except ImportError:
-    print("Installing required packages...")
-    os.system("pip install requests rich")
+    print("Installing required packages (quiet mode)...")
+    install_cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--quiet",
+        "requests",
+        "rich",
+    ]
+    install_result = subprocess.run(install_cmd, capture_output=True, text=True)
+    if install_result.returncode != 0:
+        print("Dependency installation failed.")
+        error_text = (install_result.stderr or install_result.stdout).strip()
+        if error_text:
+            lines = error_text.splitlines()
+            print("Details:")
+            print("\n".join(lines[-8:]))
+        raise SystemExit(1)
+    print("Dependencies installed.")
     import requests
     from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
     from rich.table import Table
     from rich.panel import Panel
     from rich.prompt import Confirm, Prompt
@@ -49,6 +69,8 @@ CONFIG = {
     "ROOT": r"/r/media/tv",
     "API_SEARCH": "https://api.tvmaze.com/search/shows?q=",
     "API_EPISODES": "https://api.tvmaze.com/shows",
+    "TVDB_API_BASE": "https://api4.thetvdb.com/v4",
+    "PREFERRED_SOURCE": "tvmaze",  # tvmaze | tvdb
     "SUPPORTED_EXTENSIONS": {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".flv", ".wmv"},
     "BACKUP_DIR": r"/r/media/tv/.backups",
     "HISTORY_FILE": r"/r/media/tv/.backups/rename_history.json",
@@ -65,6 +87,7 @@ class RenameAction:
     """Represents a single file rename operation."""
     original_path: str
     new_path: str
+    media_type: str
     show_name: str
     season: int
     episode: int
@@ -120,30 +143,146 @@ class TVMazeAPI:
         self.cache = cache
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'PlexRenamer/1.0'})
+        self.tvdb_api_key = os.getenv("TVDB_API_KEY", "").strip()
+        self.tvdb_pin = os.getenv("TVDB_PIN", "").strip()
+        self.tvdb_token: Optional[str] = None
+
+    def _tvdb_headers(self) -> Optional[Dict[str, str]]:
+        """Build TVDB auth headers if credentials are available."""
+        if not self.tvdb_api_key:
+            return None
+
+        if not self.tvdb_token and not self._tvdb_login():
+            return None
+
+        return {
+            'Authorization': f'Bearer {self.tvdb_token}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        }
+
+    def _tvdb_login(self) -> bool:
+        """Authenticate with TVDB v4 API and cache token in memory."""
+        if not self.tvdb_api_key:
+            return False
+
+        payload = {'apikey': self.tvdb_api_key}
+        if self.tvdb_pin:
+            payload['pin'] = self.tvdb_pin
+
+        try:
+            url = f"{CONFIG['TVDB_API_BASE']}/login"
+            response = self.session.post(url, json=payload, timeout=8)
+            response.raise_for_status()
+            data = response.json()
+            token = data.get('data', {}).get('token')
+            if token:
+                self.tvdb_token = token
+                return True
+        except Exception as e:
+            console.print(f"[yellow]Warning: TVDB login failed: {e}[/yellow]")
+
+        return False
+
+    def _search_show_tvdb(self, query: str) -> Optional[Dict]:
+        """Search for a show in TVDB."""
+        headers = self._tvdb_headers()
+        if not headers:
+            return None
+
+        try:
+            url = f"{CONFIG['TVDB_API_BASE']}/search"
+            params = {'query': query, 'type': 'series'}
+            response = self.session.get(url, params=params, headers=headers, timeout=8)
+            response.raise_for_status()
+            results = response.json().get('data', [])
+
+            if results:
+                series = results[0]
+                series_id = series.get('tvdb_id') or series.get('id')
+                if series_id:
+                    return {
+                        'id': int(series_id),
+                        'name': series.get('name', query),
+                        '_source': 'tvdb',
+                    }
+        except Exception as e:
+            console.print(f"[yellow]Warning: TVDB show lookup failed for '{query}': {e}[/yellow]")
+
+        return None
+
+    def _get_episode_tvdb(self, series_id: int, season: int, episode: int) -> Optional[str]:
+        """Get episode title from TVDB."""
+        headers = self._tvdb_headers()
+        if not headers:
+            return None
+
+        try:
+            url = f"{CONFIG['TVDB_API_BASE']}/series/{series_id}/episodes/default/{season}/{episode}"
+            response = self.session.get(url, headers=headers, timeout=8)
+            response.raise_for_status()
+            data = response.json().get('data', {})
+            return data.get('name')
+        except Exception:
+            # Fall back to season endpoint for broader compatibility with API variants.
+            try:
+                url = f"{CONFIG['TVDB_API_BASE']}/series/{series_id}/episodes/official"
+                params = {'season': season}
+                response = self.session.get(url, params=params, headers=headers, timeout=8)
+                response.raise_for_status()
+                episodes = response.json().get('data', {}).get('episodes', [])
+                for ep in episodes:
+                    if ep.get('number') == episode:
+                        return ep.get('name')
+            except Exception as e:
+                console.print(f"[yellow]Warning: TVDB episode lookup failed: {e}[/yellow]")
+
+        return None
     
     def search_show(self, query: str) -> Optional[Dict]:
         """Search for a show by name."""
         cached = self.cache.get_show(query)
         if cached:
             return cached
-        
-        try:
-            url = f"{CONFIG['API_SEARCH']}{query}"
-            response = self.session.get(url, timeout=5)
-            response.raise_for_status()
-            
-            data = response.json()
-            if data:
-                show_data = data[0].get('show', {})
-                self.cache.set_show(query, show_data)
-                return show_data
-        except Exception as e:
-            console.print(f"[red]API Error searching for '{query}': {e}[/red]")
+
+        preferred = CONFIG.get('PREFERRED_SOURCE', 'tvmaze').strip().lower()
+        ordered_sources = ['tvdb', 'tvmaze'] if preferred == 'tvdb' else ['tvmaze', 'tvdb']
+
+        for source in ordered_sources:
+            if source == 'tvmaze':
+                try:
+                    url = f"{CONFIG['API_SEARCH']}{query}"
+                    response = self.session.get(url, timeout=5)
+                    response.raise_for_status()
+
+                    data = response.json()
+                    if data:
+                        show_data = data[0].get('show', {})
+                        if show_data.get('id'):
+                            show_data['_source'] = 'tvmaze'
+                            self.cache.set_show(query, show_data)
+                            return show_data
+                except Exception as e:
+                    console.print(f"[red]API Error searching TVMaze for '{query}': {e}[/red]")
+
+            if source == 'tvdb':
+                show_data = self._search_show_tvdb(query)
+                if show_data:
+                    self.cache.set_show(query, show_data)
+                    return show_data
         
         return None
     
     def get_episode(self, show_id: int, season: int, episode: int) -> Optional[str]:
         """Get episode name from show ID."""
+        # Try preferred source first, then fallback.
+        preferred = CONFIG.get('PREFERRED_SOURCE', 'tvmaze').strip().lower()
+
+        if preferred == 'tvdb':
+            ep_name = self._get_episode_tvdb(show_id, season, episode)
+            if ep_name:
+                return ep_name
+
         try:
             url = f"{CONFIG['API_EPISODES']}/{show_id}/episodes"
             response = self.session.get(url, timeout=5)
@@ -155,6 +294,9 @@ class TVMazeAPI:
                     return ep.get('name')
         except Exception as e:
             console.print(f"[yellow]Warning: Could not fetch episode info: {e}[/yellow]")
+
+        if preferred != 'tvdb':
+            return self._get_episode_tvdb(show_id, season, episode)
         
         return None
 
@@ -168,6 +310,20 @@ class ShowDetector:
     
     def __init__(self, api: TVMazeAPI):
         self.api = api
+
+    def _is_generic_folder_name(self, name: str) -> bool:
+        """Return True for folder names that are not reliable show titles."""
+        generic_patterns = [
+            r'(?i)^season\s*\d+$',
+            r'(?i)^s\d+$',
+            r'(?i)^specials?$',
+            r'(?i)^extras?$',
+            r'(?i)^episodes?$',
+            r'(?i)^complete\s*series$',
+            r'(?i)^disc\s*\d+$',
+            r'(?i)^cd\s*\d+$',
+        ]
+        return any(re.fullmatch(pattern, name.strip()) for pattern in generic_patterns)
     
     def clean_name(self, name: str) -> str:
         """Remove special characters and normalize."""
@@ -185,7 +341,19 @@ class ShowDetector:
         
         if not cleaned:
             return None
-        
+
+        if self._is_generic_folder_name(cleaned):
+            # Use parent folder when current folder is only a season/disc marker.
+            parent = os.path.dirname(folder_path)
+            if parent and parent != folder_path:
+                parent_name = os.path.basename(parent)
+                cleaned_parent = self.clean_name(parent_name)
+                if cleaned_parent:
+                    show = self.api.search_show(cleaned_parent)
+                    if show and show.get('id'):
+                        return cleaned_parent, show
+            return None
+
         # Try direct search
         show = self.api.search_show(cleaned)
         if show and show.get('id'):
@@ -210,6 +378,27 @@ class ShowDetector:
                 if show and show.get('id'):
                     return base, show
         
+        return None
+
+    def guess_show_from_filename(self, filename: str) -> Optional[Tuple[str, Dict]]:
+        """Guess show name from filename when folder names are generic."""
+        stem = os.path.splitext(filename)[0]
+
+        # Trim everything from the first episode marker onward.
+        stem = re.sub(r'(?i)\b[sS]\d{1,2}[eE]\d{1,2}.*$', '', stem)
+        stem = re.sub(r'(?i)\b\d{1,2}x\d{1,2}.*$', '', stem)
+        stem = re.sub(r'(?i)\bseason[\s._-]*\d+[\s._-]*(?:episode|ep)[\s._-]*\d+.*$', '', stem)
+
+        # Clean trailing separators left behind after trimming.
+        stem = re.sub(r'[\s._-]+$', '', stem)
+        cleaned = self.clean_name(stem)
+        if not cleaned:
+            return None
+
+        show = self.api.search_show(cleaned)
+        if show and show.get('id'):
+            return cleaned, show
+
         return None
     
     def find_best_match(self, query: str, known_shows: List[str]) -> Optional[str]:
@@ -244,6 +433,8 @@ class EpisodeExtractor:
         patterns = [
             r'[sS](\d+)[eE](\d+)(?:-[eE](\d+))?',  # S01E01 or S01E01-E03
             r'(\d+)x(\d+)',  # 1x01
+            # Season 1 Episode 01 or Season_1_Ep_01 variants
+            r'[sS]eason[\s._-]*(\d+)[\s._-]*(?:[eE]pisode|[eE]p)[\s._-]*(\d+)(?:-(?:[eE]pisode|[eE]p)?(\d+)|[\s._-]*(?:to|through|thru)[\s._-]*(?:[eE]pisode|[eE]p)?[\s._-]*(\d+))?',
         ]
         
         for pattern in patterns:
@@ -251,7 +442,8 @@ class EpisodeExtractor:
             if match:
                 season = int(match.group(1))
                 start_ep = int(match.group(2))
-                end_ep = int(match.group(3)) if match.lastindex >= 3 else None
+                end_raw = next((g for g in match.groups()[2:] if g is not None), None)
+                end_ep = int(end_raw) if end_raw else None
                 return season, start_ep, end_ep
         
         return None
@@ -260,9 +452,10 @@ class EpisodeExtractor:
 class FileRenamer:
     """Handles file scanning and rename planning."""
     
-    def __init__(self, api: TVMazeAPI, detector: ShowDetector):
+    def __init__(self, api: TVMazeAPI, detector: ShowDetector, root_path: str):
         self.api = api
         self.detector = detector
+        self.root_path = root_path
     
     def scan_media_files(self, root_path: str) -> List[str]:
         """Scan for media files."""
@@ -272,8 +465,78 @@ class FileRenamer:
                 if any(filename.lower().endswith(ext) for ext in CONFIG['SUPPORTED_EXTENSIONS']):
                     files.append(os.path.join(root, filename))
         return files
+
+    @staticmethod
+    def _clean_movie_title(value: str) -> str:
+        """Normalize movie title text from folder/file names."""
+        value = re.sub(r'\[.*?\]', '', value)
+        value = re.sub(r'\(.*?\)$', '', value)
+        value = re.sub(r'\b(720p|1080p|2160p|bluray|webrip|x264|x265|h264|h265|dvdrip)\b', '', value, flags=re.I)
+        value = value.replace('.', ' ').replace('_', ' ')
+        value = re.sub(r'\s+', ' ', value).strip(' -')
+        return value
+
+    @staticmethod
+    def _extract_movie_title_year(filename: str, folder_path: str) -> Tuple[Optional[str], Optional[int]]:
+        """Extract best-effort movie title and optional year from file/folder names."""
+        stem = os.path.splitext(os.path.basename(filename))[0]
+        folder_name = os.path.basename(folder_path)
+
+        generic_folder_names = {
+            "movies", "movie", "films", "film", "videos", "video", "media"
+        }
+
+        year = None
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', stem)
+        if not year_match:
+            year_match = re.search(r'\b(19\d{2}|20\d{2})\b', folder_name)
+        if year_match:
+            year = int(year_match.group(1))
+
+        # Prefer folder title when it looks specific, otherwise file stem.
+        if folder_name.strip().lower() in generic_folder_names:
+            base = stem
+        else:
+            base = folder_name if len(folder_name) >= 4 else stem
+        title = re.split(r'\b(19\d{2}|20\d{2})\b', base)[0]
+        title = FileRenamer._clean_movie_title(title)
+        if not title:
+            title = FileRenamer._clean_movie_title(re.split(r'\b(19\d{2}|20\d{2})\b', stem)[0])
+
+        return (title or None), year
+
+    def plan_movie_rename(self, file_path: str) -> Optional[RenameAction]:
+        """Plan a movie rename to Plex movie format: Movie Name (Year)/Movie Name (Year).ext"""
+        filename = os.path.basename(file_path)
+        dir_path = os.path.dirname(file_path)
+        ext = os.path.splitext(filename)[1]
+
+        title, year = self._extract_movie_title_year(filename, dir_path)
+        if not title:
+            return None
+
+        if year:
+            movie_base = f"{title} ({year})"
+        else:
+            movie_base = title
+
+        new_filename = f"{movie_base}{ext}"
+        new_path = os.path.join(self.root_path, movie_base, new_filename)
+
+        if file_path.lower() == new_path.lower():
+            return None
+
+        return RenameAction(
+            original_path=file_path,
+            new_path=new_path,
+            media_type="movies",
+            show_name=movie_base,
+            season=0,
+            episode=0,
+            episode_name="Movie"
+        )
     
-    def plan_rename(self, file_path: str) -> Optional[RenameAction]:
+    def plan_tv_rename(self, file_path: str) -> Optional[RenameAction]:
         """Plan a single file rename."""
         filename = os.path.basename(file_path)
         dir_path = os.path.dirname(file_path)
@@ -288,6 +551,8 @@ class FileRenamer:
         
         # Detect show
         show_match = self.detector.guess_show_from_folder(dir_path)
+        if not show_match:
+            show_match = self.detector.guess_show_from_filename(filename)
         if not show_match:
             return None
         
@@ -309,12 +574,12 @@ class FileRenamer:
         
         # Format episode string
         if end_ep:
-            ep_str = f"s{season:02d}e{start_ep:02d}-e{end_ep:02d}"
+            ep_str = f"{season}x{start_ep:02d}-x{end_ep:02d}"
         else:
-            ep_str = f"s{season:02d}e{start_ep:02d}"
+            ep_str = f"{season}x{start_ep:02d}"
         
         new_filename = f"{show_name} - {ep_str} - {ep_name}{ext}"
-        new_path = os.path.join(CONFIG['ROOT'], show_folder, season_folder, new_filename)
+        new_path = os.path.join(self.root_path, show_folder, season_folder, new_filename)
         
         # Skip if already correctly named
         if file_path.lower() == new_path.lower():
@@ -323,11 +588,26 @@ class FileRenamer:
         return RenameAction(
             original_path=file_path,
             new_path=new_path,
+            media_type="tv",
             show_name=show_name,
             season=season,
             episode=start_ep,
             episode_name=ep_name
         )
+
+    def plan_rename(self, file_path: str, media_type: str) -> Optional[RenameAction]:
+        """Plan a rename based on the selected media type."""
+        normalized = media_type.strip().lower()
+        if normalized == "tv":
+            return self.plan_tv_rename(file_path)
+        if normalized == "movies":
+            return self.plan_movie_rename(file_path)
+        if normalized == "both":
+            tv_action = self.plan_tv_rename(file_path)
+            if tv_action:
+                return tv_action
+            return self.plan_movie_rename(file_path)
+        return None
 
 
 # ============================================================================
@@ -361,6 +641,7 @@ class RenameHistory:
             "timestamp": datetime.now().isoformat(),
             "original": action.original_path,
             "new": action.new_path,
+            "media_type": action.media_type,
             "show": action.show_name,
             "season": action.season,
             "episode": action.episode,
@@ -397,21 +678,94 @@ class RenameHistory:
 
 class PlexRenamer:
     """Main application class."""
+
+    @staticmethod
+    def _has_media_files(path: str, max_dirs: int = 200) -> bool:
+        """Fast check for at least one supported media file under a path."""
+        checked = 0
+        for root, _, files in os.walk(path):
+            checked += 1
+            for name in files:
+                if any(name.lower().endswith(ext) for ext in CONFIG['SUPPORTED_EXTENSIONS']):
+                    return True
+            if checked >= max_dirs:
+                break
+        return False
+
+    @staticmethod
+    def _resolve_root_path(root_path: str, media_type: str = "tv") -> str:
+        """Resolve a usable media root across common Windows/Linux path styles."""
+        if os.path.exists(root_path) and PlexRenamer._has_media_files(root_path):
+            return root_path
+
+        if media_type == "movies":
+            candidates = [
+                r"R:\media\movies",
+                r"R:\media\Movies",
+                r"/r/media/movies",
+                r"/r/media/Movies",
+            ]
+        elif media_type == "both":
+            candidates = [
+                r"R:\media",
+                r"/r/media",
+                r"R:\media\tv",
+                r"R:\media\movies",
+            ]
+        else:
+            candidates = [
+                r"R:\media\tv",
+                r"R:\media\TV",
+                r"/r/media/tv",
+                r"/r/media/TV",
+            ]
+
+        for candidate in candidates:
+            if os.path.exists(candidate) and PlexRenamer._has_media_files(candidate):
+                return candidate
+
+        if os.path.exists(root_path):
+            return root_path
+
+        return root_path
     
-    def __init__(self, root_path: str = CONFIG['ROOT']):
-        self.root_path = root_path
-        self.cache = ShowCache(CONFIG['CACHE_FILE'])
+    def __init__(self, root_path: str = CONFIG['ROOT'], media_type: str = "tv"):
+        self.media_type = media_type
+        self.root_path = self._resolve_root_path(root_path, media_type)
+        self.backup_dir = os.path.join(self.root_path, ".backups")
+        self.cache_file = os.path.join(self.backup_dir, "show_cache.json")
+        self.history_file = os.path.join(self.backup_dir, "rename_history.json")
+
+        self.cache = ShowCache(self.cache_file)
         self.api = TVMazeAPI(self.cache)
         self.detector = ShowDetector(self.api)
-        self.renamer = FileRenamer(self.api, self.detector)
-        self.history = RenameHistory(CONFIG['HISTORY_FILE'])
+        self.renamer = FileRenamer(self.api, self.detector, self.root_path)
+        self.history = RenameHistory(self.history_file)
         self.actions: List[RenameAction] = []
+
+    def configure_runtime(self, root_path: str, media_type: str):
+        """Update runtime target folder and media type from interactive prompts."""
+        selected_type = media_type.strip().lower()
+        resolved_root = self._resolve_root_path(root_path, selected_type)
+
+        self.media_type = selected_type
+        self.root_path = resolved_root
+        self.backup_dir = os.path.join(self.root_path, ".backups")
+        self.cache_file = os.path.join(self.backup_dir, "show_cache.json")
+        self.history_file = os.path.join(self.backup_dir, "rename_history.json")
+
+        self.cache = ShowCache(self.cache_file)
+        self.api = TVMazeAPI(self.cache)
+        self.detector = ShowDetector(self.api)
+        self.renamer = FileRenamer(self.api, self.detector, self.root_path)
+        self.history = RenameHistory(self.history_file)
+        self.actions = []
     
     def display_banner(self):
         """Display welcome banner."""
         console.print(Panel(
-            "[bold cyan]Plex TV Show Renamer[/bold cyan]\n"
-            "Professional tool for organizing TV shows in Plex format",
+            "[bold cyan]Plex Media Renamer[/bold cyan]\n"
+            "Organize TV shows and movies in Plex format",
             style="cyan"
         ))
     
@@ -422,15 +776,21 @@ class PlexRenamer:
             return
         
         table = Table(title=f"Rename Plan ({len(self.actions)} files)")
-        table.add_column("Show", style="cyan")
-        table.add_column("Episode", style="magenta")
+        table.add_column("Type", style="yellow")
+        table.add_column("Title", style="cyan")
+        table.add_column("Info", style="magenta")
         table.add_column("Status", style="green")
         
         for action in self.actions:
             ep_name = action.episode_name[:30] + "..." if len(action.episode_name) > 30 else action.episode_name
+            if action.media_type == "tv":
+                info = f"S{action.season:02d}E{action.episode:02d}"
+            else:
+                info = "Movie"
             table.add_row(
+                action.media_type,
                 action.show_name,
-                f"S{action.season:02d}E{action.episode:02d}",
+                info,
                 ep_name
             )
         
@@ -444,22 +804,21 @@ class PlexRenamer:
         console.print(f"Found [cyan]{len(files)}[/cyan] media files")
         
         self.actions = []
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("[cyan]Processing files...", total=len(files))
-            
-            for file_path in files:
-                action = self.renamer.plan_rename(file_path)
-                if action:
-                    self.actions.append(action)
-                progress.update(task, advance=1)
+
+        if not files:
+            console.print("[yellow]No media files found.[/yellow]")
+            return
+
+        status_step = max(1, len(files) // 10)
+        console.print("[cyan]Planning renames...[/cyan]")
+
+        for idx, file_path in enumerate(files, start=1):
+            action = self.renamer.plan_rename(file_path, self.media_type)
+            if action:
+                self.actions.append(action)
+
+            if idx % status_step == 0 or idx == len(files):
+                console.print(f"  Processed {idx}/{len(files)} files")
         
         console.print(f"\nPlanned [cyan]{len(self.actions)}[/cyan] rename operations")
     
@@ -469,31 +828,26 @@ class PlexRenamer:
             return
         
         console.print(f"\n[bold]Applying {len(self.actions)} changes...[/bold]\n")
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            console=console
-        ) as progress:
-            task = progress.add_task("[cyan]Renaming files...", total=len(self.actions))
-            
-            for action in self.actions:
-                try:
-                    # Create parent directories
-                    os.makedirs(os.path.dirname(action.new_path), exist_ok=True)
-                    
-                    # Move file
-                    shutil.move(action.original_path, action.new_path)
-                    
-                    # Record in history
-                    self.history.record_rename(action)
-                    
-                except Exception as e:
-                    console.print(f"[red]Error: {action.original_path} -> {e}[/red]")
+
+        total = len(self.actions)
+        status_step = max(1, total // 10)
+
+        for idx, action in enumerate(self.actions, start=1):
+            try:
+                # Create parent directories
+                os.makedirs(os.path.dirname(action.new_path), exist_ok=True)
                 
-                progress.update(task, advance=1)
+                # Move file
+                shutil.move(action.original_path, action.new_path)
+                
+                # Record in history
+                self.history.record_rename(action)
+                
+            except Exception as e:
+                console.print(f"[red]Error: {action.original_path} -> {e}[/red]")
+
+            if idx % status_step == 0 or idx == total:
+                console.print(f"  Applied {idx}/{total} changes")
         
         console.print("\n[green]✓ All changes applied successfully![/green]")
     
@@ -506,15 +860,22 @@ class PlexRenamer:
         
         table = Table(title=f"Recent Renames (last {len(recent)})")
         table.add_column("Timestamp", style="cyan")
-        table.add_column("Show", style="magenta")
-        table.add_column("Episode", style="green")
+        table.add_column("Type", style="yellow")
+        table.add_column("Title", style="magenta")
+        table.add_column("Info", style="green")
         
         for record in recent[-10:]:
             timestamp = record['timestamp'][:19]
+            media_type = record.get('media_type', 'tv')
+            if media_type == 'tv':
+                info = f"S{record.get('season', 0):02d}E{record.get('episode', 0):02d}"
+            else:
+                info = 'Movie'
             table.add_row(
                 timestamp,
+                media_type,
                 record['show'],
-                f"S{record['season']:02d}E{record['episode']:02d}"
+                info
             )
         
         console.print(table)
@@ -522,6 +883,12 @@ class PlexRenamer:
     def interactive_menu(self):
         """Interactive menu."""
         self.display_banner()
+
+        entered_root = Prompt.ask("Media folder path", default=self.root_path).strip()
+        media_type = Prompt.ask("Media type", choices=["tv", "movies", "both"], default=self.media_type)
+        self.configure_runtime(entered_root, media_type)
+        console.print(f"Using folder: [cyan]{self.root_path}[/cyan]")
+        console.print(f"Media type: [cyan]{self.media_type}[/cyan]")
         
         while True:
             console.print("\n[bold cyan]Options:[/bold cyan]")
